@@ -1,6 +1,7 @@
 //! Implementation of [`TaskContext`]
 use crate::trap::trap_return;
 use super::coroutine::CoroutineContext;
+
 #[repr(C)]
 /// task context structure containing some registers
 pub struct TaskContext {
@@ -16,11 +17,15 @@ unsafe extern "C" {
         current_ctx: *mut CoroutineContext,
         next_ctx: *const CoroutineContext,
     );
-}pub unsafe fn coroutine_switch(
+}
+pub unsafe fn coroutine_switch(
     current_ctx: *mut CoroutineContext,
     next_ctx: *const CoroutineContext,
 ) {
-    __switch_co(current_ctx, next_ctx);
+    // 将 unsafe 函数调用包裹在 unsafe 块中
+    unsafe {
+        __switch_co(current_ctx, next_ctx);
+    }
 }
 impl TaskContext {
     /// init task context

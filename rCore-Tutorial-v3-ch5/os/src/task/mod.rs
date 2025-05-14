@@ -12,7 +12,7 @@
 //! A single global instance of [`PidAllocator`] called `PID_ALLOCATOR` allocates
 //! pid for user apps.
 //!
-//! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
+//! Be careful when you see `__switch __switch_co` ASM function in `switch.S`. Control flow around this function
 //! might not be what you expect.
 mod context;
 mod manager;
@@ -29,6 +29,9 @@ use alloc::sync::Arc;
 use lazy_static::*;
 pub use manager::{TaskManager, fetch_task};
 use switch::__switch;
+
+
+
 use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
@@ -120,6 +123,7 @@ lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new(TaskControlBlock::new(
         get_app_data_by_name("initproc").unwrap()
     ));
+    /// 全局协程管理器，负责协程的创建、调度和状态管理
     pub static ref COROUTINE_MANAGER: UPSafeCell<CoroutineManager> = unsafe {
         UPSafeCell::new(CoroutineManager::new())
     };
