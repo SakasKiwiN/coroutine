@@ -1,12 +1,14 @@
 // src/task/coroutine.rs
 use crate::sync::UPSafeCell;
+use crate::task::context::TaskContext; // 引入已有的TaskContext
 use alloc::sync::{Arc};
 use alloc::vec::Vec;
 use alloc::collections::VecDeque;
 use core::cell::RefMut;
+use crate::task::switch::__switch;
 
 /// 协程的状态枚举
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq,Debug)]
 pub enum CoroutineStatus {
     /// 协程准备就绪，可以运行
     Ready,
@@ -16,17 +18,6 @@ pub enum CoroutineStatus {
     Blocked,
     /// 协程已退出
     Exited,
-}
-
-/// 协程的上下文，保存协程切换时的寄存器状态
-#[repr(C)]  // 添加这个属性使结构体对 FFI 安全
-pub struct CoroutineContext {
-    /// 返回地址寄存器
-    pub ra: usize,
-    /// 栈指针寄存器
-    pub sp: usize,
-    /// s0-s11 保存寄存器数组
-    pub s: [usize; 12], // s0-s11 寄存器
 }
 
 /// 协程控制块，管理单个协程的所有信息
@@ -41,8 +32,8 @@ pub struct CoroutineControlBlock {
 pub struct CoroutineInner {
     /// 协程当前的状态
     pub status: CoroutineStatus,
-    /// 协程的上下文信息
-    pub context: CoroutineContext,
+    /// 协程的上下文信息，使用系统已有的TaskContext
+    pub context: TaskContext,
     /// 协程栈的虚拟地址空间起始地址
     pub stack_base: usize,
     /// 协程栈大小
@@ -52,6 +43,8 @@ pub struct CoroutineInner {
     /// 协程函数的参数
     pub arg: usize,
 }
+
+
 
 impl CoroutineControlBlock {
     /// 创建新协程控制块
@@ -74,16 +67,17 @@ impl CoroutineControlBlock {
             NEXT_CID
         };
 
+        // 计算栈指针位置（栈从高地址向低地址增长）
+        let stack_top = stack_base + stack_size;
+
         Self {
             cid,
             inner: unsafe {
                 UPSafeCell::new(CoroutineInner {
                     status: CoroutineStatus::Ready,
-                    context: CoroutineContext {
-                        ra: entry,
-                        sp: stack_base + stack_size, // 栈从高地址向低地址增长
-                        s: [0; 12],
-                    },
+                    // 使用TaskContext::goto_trap_return初始化上下文
+                    // 这里假设协程恢复时也需要通过trap_return机制
+                    context: TaskContext::goto_trap_return(stack_top),
                     stack_base,
                     stack_size,
                     entry,
@@ -154,17 +148,35 @@ impl CoroutineManager {
         // 将协程添加到列表和就绪队列
         self.coroutines.push(coroutine.clone());
         self.ready_queue.push_back(coroutine.clone());
-
         coroutine
+
     }
 
     /// 切换到下一个就绪的协程
     ///
     /// # 返回值
     ///
+    /// 如果成功切换，返回true，如果没有就绪的协程可切换，返回false
+    pub fn switch_to_next_coroutine(&mut self) -> bool {
+        // 准备上下文切换所需的信息
+        if let Some(pair) = self.prepare_next_coroutine() {
+            let (current, next) = pair;
+
+            // 执行上下文切换
+            self.perform_switch(&current, &next);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 准备下一个要切换的协程
+    ///
+    /// # 返回值
+    ///
     /// 如果有下一个就绪的协程，返回当前协程和下一个协程的引用对
     /// 如果没有就绪的协程，返回None
-    pub fn switch_to_next_coroutine(&mut self) -> Option<(Arc<CoroutineControlBlock>, Arc<CoroutineControlBlock>)> {
+    pub fn prepare_next_coroutine(&mut self) -> Option<(Arc<CoroutineControlBlock>, Arc<CoroutineControlBlock>)> {
         // 如果没有就绪的协程，返回None
         if self.ready_queue.is_empty() {
             return None;
@@ -205,14 +217,29 @@ impl CoroutineManager {
 
             self.current_coroutine = Some(cid);
 
+            // 有当前协程，正常切换
             if let Some(current) = current {
-                Some((current, next_coroutine))
-            } else {
-                // 如果没有当前协程，返回None作为当前协程
-                None
+                return Some((current, next_coroutine));
             }
-        } else {
-            None
+        }
+
+        // 没有当前协程或没有下一个协程
+        None
+    }
+
+    /// 执行协程上下文切换
+    ///
+    /// # 参数
+    ///
+    /// * `current` - 当前协程的引用
+    /// * `next` - 下一个协程的引用
+    pub fn perform_switch(&self, current: &Arc<CoroutineControlBlock>, next: &Arc<CoroutineControlBlock>) {
+        let current_ptr = &mut current.inner_exclusive_access().context as *mut TaskContext;
+        let next_ptr = &next.inner_exclusive_access().context as *const TaskContext;
+
+        // 使用系统提供的__switch函数进行上下文切换
+        unsafe {
+            __switch(current_ptr, next_ptr);
         }
     }
 
@@ -262,5 +289,37 @@ impl CoroutineManager {
         } else {
             false
         }
+    }
+    ///
+    /// 就不写
+    /// 我就不写
+    pub fn try_resume_coroutine(&mut self, cid: usize) -> bool {
+        // 实现恢复协程的逻辑
+        // 只在此方法内部访问私有字段
+
+        // 检查是否是当前正在运行的协程
+        if let Some(current_cid) = self.current_coroutine {
+            if current_cid == cid {
+                // 已经在运行，无需操作
+                return false;
+            }
+        }
+
+        // 检查是否在阻塞队列中
+        if self.unblock_coroutine(cid) {
+            // 已经成功从阻塞队列移到就绪队列
+            return true;
+        }
+
+        // 检查是否已经在就绪队列中
+        for coroutine in &self.ready_queue {
+            if coroutine.cid == cid {
+                // 已经在就绪队列，无需操作
+                return true;
+            }
+        }
+
+        // 找不到协程或处于其他状态
+        false
     }
 }

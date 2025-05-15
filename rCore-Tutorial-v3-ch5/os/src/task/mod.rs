@@ -22,6 +22,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 mod coroutine;
+
 use crate::sync::UPSafeCell;
 use crate::loader::get_app_data_by_name;
 use crate::sbi::shutdown;
@@ -30,22 +31,23 @@ use lazy_static::*;
 pub use manager::{TaskManager, fetch_task};
 use switch::__switch;
 
-
-
 use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
 pub use manager::add_task;
 pub use pid::{KernelStack, PidAllocator, PidHandle, pid_alloc};
 
-use crate::task::context::coroutine_switch;
+// 重要：使用TaskContext而非CoroutineContext来与系统保持一致
+// 从switch.S中引入协程切换函数
 pub use processor::{
     Processor, current_task, current_trap_cx, current_user_token, run_tasks, schedule,
     take_current_task,
 };
+// 从coroutine模块导出必要的类型
 pub use coroutine::{
-    CoroutineControlBlock, CoroutineContext, CoroutineStatus, CoroutineManager
+    CoroutineControlBlock, CoroutineStatus, CoroutineManager
 };
+
 /// Suspend the current 'Running' task and run the next task in task list.
 pub fn suspend_current_and_run_next() {
     // There must be an application running.
@@ -128,25 +130,46 @@ lazy_static! {
         UPSafeCell::new(CoroutineManager::new())
     };
 }
+
 ///Add init process to the manager
 pub fn add_initproc() {
     add_task(INITPROC.clone());
 }
 
-/// Create coroutine
+/// Create a new coroutine
+///
+/// # 参数
+///
+/// * `entry` - 协程入口函数的地址
+/// * `arg` - 传递给协程函数的参数
+/// * `stack_size` - 协程栈大小
+///
+/// # 返回值
+///
+/// 返回新创建的协程控制块的引用
 pub fn coroutine_create(entry: usize, arg: usize, stack_size: usize) -> Arc<CoroutineControlBlock> {
     COROUTINE_MANAGER.exclusive_access().create_coroutine(entry, arg, stack_size)
 }
 
-/// Yield current coroutine
+/// Yield current coroutine to next ready coroutine
+///
+/// # 返回值
+///
+/// 如果成功切换到其他协程返回true，否则返回false
 pub fn coroutine_yield() -> bool {
-    if let Some((current, next)) = COROUTINE_MANAGER.exclusive_access().switch_to_next_coroutine() {
+    let mut manager = COROUTINE_MANAGER.exclusive_access();
+    // 准备切换的协程对
+    if let Some((current, next)) = manager.prepare_next_coroutine() {
         // 获取两个协程的上下文指针
-        let current_ctx_ptr = &mut current.inner_exclusive_access().context as *mut CoroutineContext;
-        let next_ctx_ptr = &next.inner_exclusive_access().context as *const CoroutineContext;
+        let current_ctx_ptr = &mut current.inner_exclusive_access().context as *mut TaskContext;
+        let next_ctx_ptr = &next.inner_exclusive_access().context as *const TaskContext;
 
+        // 释放管理器锁，避免死锁
+        drop(manager);
+
+        // 执行协程切换
         unsafe {
-            coroutine_switch(current_ctx_ptr, next_ctx_ptr);
+            __switch(current_ctx_ptr, next_ctx_ptr);
         }
         true
     } else {
@@ -159,12 +182,22 @@ pub fn coroutine_block() {
     COROUTINE_MANAGER.exclusive_access().block_current_coroutine();
 }
 
-/// Resume a coroutine
+/// Resume a coroutine by its ID
+///
+/// # 参数
+///
+/// * `cid` - 要恢复的协程ID
+///
+/// # 返回值
+///
+/// 如果成功唤醒并切换到该协程返回true，否则返回false
 pub fn coroutine_resume(cid: usize) -> bool {
     let mut manager = COROUTINE_MANAGER.exclusive_access();
-    if manager.unblock_coroutine(cid) {
-        // 如果成功唤醒，尝试切换
-        drop(manager);
+    let success = manager.try_resume_coroutine(cid);
+    drop(manager);
+
+    if success {
+        // 尝试切换到下一个就绪的协程
         coroutine_yield()
     } else {
         false
